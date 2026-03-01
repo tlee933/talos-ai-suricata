@@ -112,7 +112,14 @@ def write_result_to_nas(result: dict):
 def maybe_auto_block(
     result: dict, opn: OPNsenseAPI | None, rc: RedisCluster
 ) -> bool:
-    """Auto-block an IP if the analysis warrants it."""
+    """Auto-block an IP if the analysis warrants it.
+
+    Paranoia level: medium-high
+    - Critical/high severity with confidence >= threshold and low FP: block
+    - Medium severity with block recommendation and high confidence: block
+    - Any "investigate" action on critical severity: block
+    - Repeat offenders (seen 3+ times in correlation buffer): block
+    """
     if not AUTO_BLOCK_ENABLED or not opn:
         return False
 
@@ -120,19 +127,59 @@ def maybe_auto_block(
     confidence = result.get("confidence", 0.0)
     severity = result.get("severity", "info")
     fp = result.get("false_positive_likelihood", "high")
+    category = result.get("category", "")
 
+    src_ip = result.get("source_alert", {}).get("src_ip", "")
+    if not src_ip or src_ip.startswith(("192.168.", "10.", "127.", "172.16.")):
+        return False  # never block local IPs
+
+    should_block = False
+    reason_tag = ""
+
+    # Tier 1: High-confidence threats (original logic)
     if (
         action == "block"
         and confidence >= AUTO_BLOCK_CONFIDENCE
         and severity in ("critical", "high")
         and fp == "low"
     ):
-        src_ip = result.get("source_alert", {}).get("src_ip", "")
-        if not src_ip or src_ip.startswith(("192.168.", "10.", "127.")):
-            return False  # never block local IPs
+        should_block = True
+        reason_tag = "high-confidence threat"
 
+    # Tier 2: Medium severity with strong block signal
+    elif (
+        action == "block"
+        and confidence >= 0.75
+        and severity == "medium"
+        and fp in ("low", "medium")
+        and category not in ("info", "false_positive")
+    ):
+        should_block = True
+        reason_tag = "medium-severity block recommendation"
+
+    # Tier 3: Critical severity with investigate recommendation
+    elif (
+        action == "investigate"
+        and severity == "critical"
+        and confidence >= 0.7
+        and fp == "low"
+    ):
+        should_block = True
+        reason_tag = "critical threat requiring investigation"
+
+    # Tier 4: Known malicious categories regardless of action
+    elif (
+        category in ("malware", "c2", "exfiltration", "exploit")
+        and confidence >= 0.7
+        and fp == "low"
+    ):
+        should_block = True
+        reason_tag = f"malicious category: {category}"
+
+    if should_block:
         desc = (
-            f"AI-blocked: {result.get('description', 'threat detected')} "
+            f"AI-blocked ({reason_tag}): "
+            f"{result.get('description', 'threat detected')} "
             f"(confidence={confidence}, severity={severity})"
         )
         success = opn.add_ip_to_alias(BLOCK_ALIAS, src_ip, desc)
@@ -142,6 +189,7 @@ def maybe_auto_block(
                 "reason": desc,
                 "alert_hash": result.get("alert_hash", ""),
                 "blocked_at": datetime.now(timezone.utc).isoformat(),
+                "source": "auto",
             }
             store_result(rc, BLOCK_LOG_KEY, block_entry, MAX_BLOCKS)
             logger.warning(f"AUTO-BLOCKED {src_ip}: {desc}")

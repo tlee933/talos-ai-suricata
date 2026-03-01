@@ -20,7 +20,7 @@ ExecStart=/usr/bin/podman run \
     -e REDIS_PASS=P1MC0OSpZ9Iuss5b36Bmpl2U9Yf5JwtFJTXf2Eb5WkQ= \
     -e HIVECODER_URL=http://192.168.1.100:8090/v1/chat/completions \
     -e AUTO_BLOCK=1 \
-    -e AUTO_BLOCK_CONFIDENCE=0.85 \
+    -e AUTO_BLOCK_CONFIDENCE=0.70 \
     -e BLOCK_ALIAS=ai_blocklist \
     -e LOG_LEVEL=INFO \
     localhost/ai-suricata:latest
