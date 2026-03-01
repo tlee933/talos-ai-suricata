@@ -1,0 +1,17 @@
+[Unit]
+Description=Suricata EVE JSON Syslog Receiver
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/mnt/build/opnsense/ai-suricata/eve_receiver.py
+Restart=always
+RestartSec=5
+User=hashcat
+Group=hashcat
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

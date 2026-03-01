@@ -1,0 +1,20 @@
+[Unit]
+Description=AI Suricata Metrics Dashboard
+After=network.target docker.service suricata-eve-receiver.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/mnt/build/opnsense/ai-suricata/dashboard.py
+WorkingDirectory=/var/mnt/build/opnsense/ai-suricata
+Restart=always
+RestartSec=5
+User=hashcat
+Group=hashcat
+Environment=DASHBOARD_PORT=8080
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-suricata-dashboard
+
+[Install]
+WantedBy=multi-user.target

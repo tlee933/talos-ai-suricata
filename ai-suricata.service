@@ -1,0 +1,26 @@
+[Unit]
+Description=AI Suricata Threat Analysis Daemon
+After=network.target docker.service suricata-eve-receiver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/mnt/build/opnsense/ai-suricata/ai_suricata.py
+WorkingDirectory=/var/mnt/build/opnsense/ai-suricata
+Restart=always
+RestartSec=10
+User=hashcat
+Group=hashcat
+
+# Auto-blocking disabled by default — set to 1 to enable
+Environment=AUTO_BLOCK=0
+Environment=AUTO_BLOCK_CONFIDENCE=0.9
+Environment=BLOCK_ALIAS=ai_blocklist
+Environment=LOG_LEVEL=INFO
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-suricata
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+[Unit]
+Description=AI Suricata Threat Analysis (Container)
+After=network-online.target var-mnt-ai.mount
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+ExecStartPre=-/usr/bin/podman rm -f ai-suricata
+ExecStart=/usr/bin/podman run \
+    --name ai-suricata \
+    --user 1000:1000 \
+    --network=host \
+    -v /var/mnt/ai:/var/mnt/ai \
+    -v /var/home/hashcat/.opn_creds:/tmp/.opn_creds:ro,z \
+    -e REDIS_HOST=192.168.1.100 \
+    -e REDIS_PORT=7000 \
+    -e REDIS_PASS=P1MC0OSpZ9Iuss5b36Bmpl2U9Yf5JwtFJTXf2Eb5WkQ= \
+    -e HIVECODER_URL=http://192.168.1.100:8090/v1/chat/completions \
+    -e AUTO_BLOCK=1 \
+    -e AUTO_BLOCK_CONFIDENCE=0.85 \
+    -e BLOCK_ALIAS=ai_blocklist \
+    -e LOG_LEVEL=INFO \
+    localhost/ai-suricata:latest
+
+ExecStop=/usr/bin/podman stop -t 10 ai-suricata
+
+[Install]
+WantedBy=multi-user.target
