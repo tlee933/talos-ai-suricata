@@ -310,6 +310,7 @@ def get_ai_results():
         for r in raw:
             try:
                 d = json.loads(r)
+                src_geo = d.get("source_alert", {}).get("src_geo", {})
                 results.append({
                     "severity": d.get("severity", "?"),
                     "category": d.get("category", "?"),
@@ -321,6 +322,7 @@ def get_ai_results():
                     "src_ip": d.get("source_alert", {}).get("src_ip", "?"),
                     "dest_ip": d.get("source_alert", {}).get("dest_ip", "?"),
                     "analyzed_at": d.get("analyzed_at", ""),
+                    "country": src_geo.get("country", ""),
                 })
             except json.JSONDecodeError:
                 pass
@@ -347,6 +349,7 @@ def get_ai_results_grouped():
                 subnet = ".".join(parts[:3]) + ".0/24" if len(parts) == 4 else src_ip
                 key = (sig, subnet)
                 if key not in groups:
+                    src_geo = d.get("source_alert", {}).get("src_geo", {})
                     groups[key] = {
                         "signature": sig,
                         "subnet": subnet,
@@ -359,6 +362,8 @@ def get_ai_results_grouped():
                         "total_confidence": 0.0,
                         "first_seen": d.get("analyzed_at", ""),
                         "last_seen": d.get("analyzed_at", ""),
+                        "country": src_geo.get("country", ""),
+                        "asn_org": src_geo.get("asn_org", ""),
                     }
                 g = groups[key]
                 g["count"] += 1
@@ -592,13 +597,15 @@ function actClass(a) { return 'act-' + (a || 'ignore'); }
 
 function renderAITable(results) {
   if (!results.length) return '<p style="color:#8b949e;padding:10px;">No AI results yet</p>';
-  let html = '<table><thead><tr><th>Severity</th><th>Category</th><th>Action</th><th>Conf</th><th>Src IP</th><th>Signature</th><th>Description</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Severity</th><th>Category</th><th>Action</th><th>Conf</th><th></th><th>Src IP</th><th>Signature</th><th>Description</th></tr></thead><tbody>';
   for (const r of results) {
+    const flag = ccToFlag(r.country || '');
     html += '<tr>';
     html += '<td class="' + sevClass(r.severity) + '">' + r.severity + '</td>';
     html += '<td>' + r.category + '</td>';
     html += '<td class="' + actClass(r.action) + '">' + r.action + '</td>';
     html += '<td>' + (r.confidence || 0).toFixed(1) + '</td>';
+    html += '<td class="flag">' + flag + '</td>';
     html += '<td class="bytes">' + r.src_ip + '</td>';
     html += '<td>' + (r.signature || '').substring(0, 45) + '</td>';
     html += '<td>' + (r.description || '').substring(0, 80) + '</td>';
@@ -610,8 +617,10 @@ function renderAITable(results) {
 
 function renderGroupedTable(groups) {
   if (!groups.length) return '<p style="color:#8b949e;padding:10px;">No grouped results yet</p>';
-  let html = '<table><thead><tr><th>Count</th><th>IPs</th><th>Severity</th><th>Category</th><th>Action</th><th>Avg Conf</th><th>Subnet</th><th>Signature</th><th>Description</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Count</th><th>IPs</th><th>Severity</th><th>Category</th><th>Action</th><th>Conf</th><th>Origin</th><th>Subnet</th><th>Signature</th><th>Description</th></tr></thead><tbody>';
   for (const g of groups) {
+    const flag = ccToFlag(g.country || '');
+    const origin = flag ? flag + ' ' + (g.asn_org || '').substring(0, 20) : (g.asn_org || '').substring(0, 20);
     html += '<tr>';
     html += '<td style="font-weight:700;color:#f0f6fc">' + g.count + '</td>';
     html += '<td>' + g.unique_ips + '</td>';
@@ -619,9 +628,10 @@ function renderGroupedTable(groups) {
     html += '<td>' + g.category + '</td>';
     html += '<td class="' + actClass(g.action) + '">' + g.action + '</td>';
     html += '<td>' + (g.avg_confidence || 0).toFixed(2) + '</td>';
+    html += '<td>' + origin + '</td>';
     html += '<td class="bytes">' + g.subnet + '</td>';
     html += '<td>' + (g.signature || '').substring(0, 45) + '</td>';
-    html += '<td>' + (g.description || '').substring(0, 70) + '</td>';
+    html += '<td>' + (g.description || '').substring(0, 60) + '</td>';
     html += '</tr>';
   }
   html += '</tbody></table>';
