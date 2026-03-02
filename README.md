@@ -144,8 +144,8 @@ Currently deployed on a 2-node setup:
 
 | Node | Role | Specs |
 |------|------|-------|
-| **alderlake** | Container host (eve_receiver, ai_suricata, dashboard) | i7-12700 (8P+4E, 20T), 64GB RAM, Fedora CoreOS |
-| **aurora** | LLM inference + Redis primary | Ryzen 9, R9700 32GB VRAM, ROCm 7.12, Fedora Kinoite 43 |
+| **alderlake** | Container host (eve_receiver, ai_suricata, dashboard) | i7-12700 (8P+4E, 20T), 64GB RAM, PowerColor Red Devil RX 6700 XT 12GB, Fedora CoreOS |
+| **aurora** | LLM inference + Redis primary | Ryzen 9, PowerColor AI PRO R9700 32GB VRAM, ROCm 7.12, Fedora Kinoite 43 |
 | **NAS** | Persistent storage | Synology, NFS, 11TB |
 | **OPNsense** | Firewall + Suricata IPS | 192.168.1.1 |
 
