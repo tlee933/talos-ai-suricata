@@ -329,6 +329,134 @@ def get_ai_results():
         return []
 
 
+def get_ai_results_grouped():
+    """Get AI results grouped by (signature, source /24 subnet)."""
+    rc = get_redis()
+    if not rc:
+        return []
+    try:
+        raw = rc.lrange("suricata:ai_results", 0, 499)
+        groups = {}  # (sig, subnet) -> group_data
+        for r in raw:
+            try:
+                d = json.loads(r)
+                sig = d.get("source_alert", {}).get("signature", "?")
+                src_ip = d.get("source_alert", {}).get("src_ip", "?")
+                # /24 subnet
+                parts = src_ip.split(".")
+                subnet = ".".join(parts[:3]) + ".0/24" if len(parts) == 4 else src_ip
+                key = (sig, subnet)
+                if key not in groups:
+                    groups[key] = {
+                        "signature": sig,
+                        "subnet": subnet,
+                        "count": 0,
+                        "unique_ips": set(),
+                        "severity": d.get("severity", "?"),
+                        "category": d.get("category", "?"),
+                        "description": d.get("description", ""),
+                        "action": d.get("recommended_action", "?"),
+                        "total_confidence": 0.0,
+                        "first_seen": d.get("analyzed_at", ""),
+                        "last_seen": d.get("analyzed_at", ""),
+                    }
+                g = groups[key]
+                g["count"] += 1
+                g["unique_ips"].add(src_ip)
+                g["total_confidence"] += d.get("confidence", 0)
+                ts = d.get("analyzed_at", "")
+                if ts and (not g["first_seen"] or ts < g["first_seen"]):
+                    g["first_seen"] = ts
+                if ts and (not g["last_seen"] or ts > g["last_seen"]):
+                    g["last_seen"] = ts
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        result = []
+        for g in groups.values():
+            g["unique_ips"] = len(g["unique_ips"])
+            g["avg_confidence"] = round(g["total_confidence"] / g["count"], 2) if g["count"] else 0
+            del g["total_confidence"]
+            result.append(g)
+        result.sort(key=lambda x: x["count"], reverse=True)
+        return result
+    except Exception:
+        return []
+
+
+def get_trends():
+    """Get historical daily stats for trend analysis."""
+    rc = get_redis()
+    if not rc:
+        return {"days": [], "error": "Redis unavailable"}
+    try:
+        raw = rc.zrangebyscore("suricata:daily_stats", "-inf", "+inf")
+        days = []
+        for item in raw:
+            try:
+                days.append(json.loads(item))
+            except json.JSONDecodeError:
+                pass
+        days.sort(key=lambda x: x.get("date", ""))
+
+        if len(days) < 2:
+            return {"days": days, "trend": "insufficient_data"}
+
+        # Compute 7-day stats
+        recent_7 = days[-7:] if len(days) >= 7 else days
+        totals = [d.get("total_alerts", 0) for d in recent_7]
+        mean_7 = sum(totals) / len(totals) if totals else 0
+        variance = sum((x - mean_7) ** 2 for x in totals) / len(totals) if totals else 0
+        stddev_7 = variance ** 0.5
+
+        # Anomaly: today > mean + 2*stddev
+        today_total = days[-1].get("total_alerts", 0) if days else 0
+        anomaly = today_total > (mean_7 + 2 * stddev_7) if stddev_7 > 0 else False
+
+        # Trend direction
+        if len(totals) >= 3:
+            first_half = sum(totals[:len(totals)//2]) / (len(totals)//2)
+            second_half = sum(totals[len(totals)//2:]) / (len(totals) - len(totals)//2)
+            if second_half > first_half * 1.2:
+                trend = "increasing"
+            elif second_half < first_half * 0.8:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "insufficient_data"
+
+        return {
+            "days": days,
+            "stats": {
+                "mean_7d": round(mean_7, 1),
+                "stddev_7d": round(stddev_7, 1),
+                "anomaly_today": anomaly,
+                "trend": trend,
+            },
+        }
+    except Exception:
+        return {"days": [], "error": "Failed to read trends"}
+
+
+def get_ai_blocks():
+    """Get AI block log from Redis."""
+    rc = get_redis()
+    if not rc:
+        return []
+    try:
+        raw = rc.lrange("suricata:ai_blocks", 0, 499)
+        blocks = []
+        for item in raw:
+            try:
+                blocks.append(json.loads(item))
+            except json.JSONDecodeError:
+                pass
+        return blocks
+    except Exception:
+        return []
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -480,6 +608,38 @@ function renderAITable(results) {
   return html;
 }
 
+function renderGroupedTable(groups) {
+  if (!groups.length) return '<p style="color:#8b949e;padding:10px;">No grouped results yet</p>';
+  let html = '<table><thead><tr><th>Count</th><th>IPs</th><th>Severity</th><th>Category</th><th>Action</th><th>Avg Conf</th><th>Subnet</th><th>Signature</th><th>Description</th></tr></thead><tbody>';
+  for (const g of groups) {
+    html += '<tr>';
+    html += '<td style="font-weight:700;color:#f0f6fc">' + g.count + '</td>';
+    html += '<td>' + g.unique_ips + '</td>';
+    html += '<td class="' + sevClass(g.severity) + '">' + g.severity + '</td>';
+    html += '<td>' + g.category + '</td>';
+    html += '<td class="' + actClass(g.action) + '">' + g.action + '</td>';
+    html += '<td>' + (g.avg_confidence || 0).toFixed(2) + '</td>';
+    html += '<td class="bytes">' + g.subnet + '</td>';
+    html += '<td>' + (g.signature || '').substring(0, 45) + '</td>';
+    html += '<td>' + (g.description || '').substring(0, 70) + '</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+let showGrouped = true;
+let cachedAI = [];
+let cachedGrouped = [];
+
+function toggleAIView() {
+  showGrouped = !showGrouped;
+  const btn = document.getElementById('toggle-view');
+  if (btn) btn.textContent = showGrouped ? 'Show Raw' : 'Show Grouped';
+  const container = document.getElementById('ai-table');
+  if (container) container.innerHTML = showGrouped ? renderGroupedTable(cachedGrouped) : renderAITable(cachedAI);
+}
+
 function ccToFlag(cc) {
   if (!cc || cc === '??' || cc === '—') return '';
   return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
@@ -505,10 +665,24 @@ function renderBlocksTable(blocks) {
   return html;
 }
 
-function buildGrid(m, ai, blocks) {
+function renderTrendChart(trends) {
+  if (!trends.days || trends.days.length < 2) return;
+  const labels = trends.days.map(d => d.date ? d.date.substring(5) : '?');
+  const totals = trends.days.map(d => d.total_alerts || 0);
+  const critical = trends.days.map(d => (d.by_severity || {}).critical || 0);
+  const blocked = trends.days.map(d => d.blocked || 0);
+  makeChart('c-trends', 'line', labels, [
+    { label: 'Total Alerts', data: totals, borderColor: '#58a6ff', backgroundColor: '#58a6ff22', fill: true, tension: 0.3 },
+    { label: 'Critical', data: critical, borderColor: '#f85149', backgroundColor: '#f8514922', fill: false, tension: 0.3 },
+    { label: 'Blocked', data: blocked, borderColor: '#3fb950', backgroundColor: '#3fb95022', fill: false, tension: 0.3 },
+  ]);
+}
+
+function buildGrid(m, ai, blocks, grouped, trends) {
   const g = document.getElementById('grid');
   g.innerHTML = `
     <div class="card wide"><h3>Traffic Over Time</h3><canvas id="c-time"></canvas></div>
+    <div class="card wide"><h3>Alert Trends (Daily)</h3><canvas id="c-trends"></canvas></div>
     <div class="card"><h3>Event Types</h3><canvas id="c-events"></canvas></div>
     <div class="card"><h3>Protocols</h3><canvas id="c-protos"></canvas></div>
     <div class="card"><h3>Top TLS Destinations (SNI)</h3><canvas id="c-sni"></canvas></div>
@@ -518,7 +692,7 @@ function buildGrid(m, ai, blocks) {
     <div class="card"><h3>TLS Versions</h3><canvas id="c-tls"></canvas></div>
     <div class="card"><h3>Interfaces</h3><canvas id="c-iface"></canvas></div>
     <div class="card full"><h3>IPS Blocked Threats</h3><div id="blocks-table"></div></div>
-    <div class="card full"><h3>AI Threat Analysis (latest 50)</h3><div id="ai-table"></div></div>
+    <div class="card full"><h3>AI Threat Analysis <button class="refresh" id="toggle-view" onclick="toggleAIView()" style="margin-left:12px;padding:4px 12px;font-size:11px;">Show Raw</button></h3><div id="ai-table"></div></div>
   `;
 
   // Summary
@@ -531,7 +705,6 @@ function buildGrid(m, ai, blocks) {
   if (m.time_series.hours.length) timeSeries('c-time', m.time_series);
   pie('c-events', m.event_types);
   pie('c-protos', m.protocols);
-  // Convert top talkers bytes to readable
   const talkerLabels = {};
   for (const [k,v] of Object.entries(m.top_talkers)) talkerLabels[k] = v;
   bar('c-talkers', talkerLabels, 0);
@@ -541,25 +714,36 @@ function buildGrid(m, ai, blocks) {
   pie('c-tls', m.tls_versions);
   pie('c-iface', m.interfaces);
 
+  // Trend chart
+  if (trends) renderTrendChart(trends);
+
   // Blocks table
   document.getElementById('s-blocks').textContent = blocks.length;
   document.getElementById('blocks-table').innerHTML = renderBlocksTable(blocks);
 
-  // AI table
-  document.getElementById('ai-table').innerHTML = renderAITable(ai);
+  // AI table — grouped by default
+  cachedAI = ai;
+  cachedGrouped = grouped || [];
+  const btn = document.getElementById('toggle-view');
+  if (btn) btn.textContent = showGrouped ? 'Show Raw' : 'Show Grouped';
+  document.getElementById('ai-table').innerHTML = showGrouped ? renderGroupedTable(cachedGrouped) : renderAITable(ai);
 }
 
 async function loadAll() {
   try {
-    const [mRes, aiRes, blkRes] = await Promise.all([
+    const [mRes, aiRes, blkRes, grpRes, trnRes] = await Promise.all([
       fetch('/api/metrics'),
       fetch('/api/ai_results'),
       fetch('/api/blocks'),
+      fetch('/api/ai_results_grouped'),
+      fetch('/api/trends'),
     ]);
     const m = await mRes.json();
     const ai = await aiRes.json();
     const blocks = await blkRes.json();
-    buildGrid(m, ai, blocks);
+    const grouped = await grpRes.json();
+    const trends = await trnRes.json();
+    buildGrid(m, ai, blocks, grouped, trends);
   } catch(e) { console.error('Load failed:', e); }
 }
 
@@ -609,6 +793,47 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(blocks).encode())
+
+        elif path == "/api/ai_results_grouped":
+            grouped = get_ai_results_grouped()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(grouped).encode())
+
+        elif path == "/api/trends":
+            trends = get_trends()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(trends).encode())
+
+        elif path == "/api/blocklist.txt":
+            blocks = get_ai_blocks()
+            ips = sorted(set(b.get("ip", "") for b in blocks if b.get("ip")))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write("\n".join(ips).encode())
+
+        elif path == "/api/blocklist.csv":
+            blocks = get_ai_blocks()
+            lines = ["ip,reason,blocked_at,source"]
+            for b in blocks:
+                ip = b.get("ip", "")
+                reason = b.get("reason", "").replace(",", ";")
+                blocked_at = b.get("blocked_at", "")
+                source = b.get("source", "")
+                lines.append(f"{ip},{reason},{blocked_at},{source}")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Disposition", "attachment; filename=blocklist.csv")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write("\n".join(lines).encode())
 
         else:
             self.send_error(404)

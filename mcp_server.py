@@ -54,6 +54,9 @@ KEY_AI_RESULTS = "suricata:ai_results"
 KEY_AI_CORRELATIONS = "suricata:ai_correlations"
 KEY_AI_SUMMARY = "suricata:ai_daily_summary"
 KEY_AI_BLOCKS = "suricata:ai_blocks"
+KEY_REPEAT_OFFENDERS = "suricata:repeat_offenders"
+KEY_REPEAT_TS = "suricata:repeat_offender_ts"
+KEY_DAILY_STATS = "suricata:daily_stats"
 
 # Prompts (inline — keep MCP server self-contained)
 ANALYSIS_SYSTEM = (
@@ -171,6 +174,17 @@ class AISuricataMCP:
             except json.JSONDecodeError:
                 continue
 
+        # Repeat offenders (top 10)
+        repeat_offenders = []
+        try:
+            top = await self.redis.zrevrangebyscore(
+                KEY_REPEAT_OFFENDERS, "+inf", "1", start=0, num=10, withscores=True
+            )
+            for ip, score in top:
+                repeat_offenders.append({"ip": ip, "appearances": int(score)})
+        except Exception:
+            pass
+
         return {
             "queued_alerts": alert_count,
             "total_eve_events": eve_count,
@@ -178,6 +192,7 @@ class AISuricataMCP:
             "ips_blocked": block_count,
             "daily_summary": summary,
             "recent_critical": critical_alerts[:10],
+            "repeat_offenders": repeat_offenders,
         }
 
     async def query_alerts(
@@ -494,6 +509,12 @@ class AISuricataMCP:
         except Exception:
             llm_status = "unreachable"
 
+        # Repeat offender count
+        try:
+            repeat_count = await self.redis.zcard(KEY_REPEAT_OFFENDERS)
+        except Exception:
+            repeat_count = 0
+
         return {
             "redis": {
                 "queued_alerts": alert_count,
@@ -501,10 +522,114 @@ class AISuricataMCP:
                 "ai_results": result_count,
                 "correlations": corr_count,
                 "blocked_ips": block_count,
+                "repeat_offenders": repeat_count,
             },
             "hivecoder": llm_status,
             "opnsense": OPNSENSE_URL,
         }
+
+    async def get_trends(self, days: int = 7) -> dict:
+        """Get historical daily stats for trend analysis."""
+        try:
+            raw = await self.redis.zrangebyscore(KEY_DAILY_STATS, "-inf", "+inf")
+            all_days = []
+            for item in raw:
+                try:
+                    all_days.append(json.loads(item))
+                except json.JSONDecodeError:
+                    pass
+            all_days.sort(key=lambda x: x.get("date", ""))
+            recent = all_days[-days:] if len(all_days) >= days else all_days
+
+            if len(recent) < 2:
+                return {"days": recent, "trend": "insufficient_data"}
+
+            totals = [d.get("total_alerts", 0) for d in recent]
+            mean = sum(totals) / len(totals)
+            variance = sum((x - mean) ** 2 for x in totals) / len(totals)
+            stddev = variance ** 0.5
+
+            today_total = recent[-1].get("total_alerts", 0)
+            anomaly = today_total > (mean + 2 * stddev) if stddev > 0 else False
+
+            if len(totals) >= 3:
+                first_half = sum(totals[:len(totals)//2]) / (len(totals)//2)
+                second_half = sum(totals[len(totals)//2:]) / (len(totals) - len(totals)//2)
+                if second_half > first_half * 1.2:
+                    trend = "increasing"
+                elif second_half < first_half * 0.8:
+                    trend = "decreasing"
+                else:
+                    trend = "stable"
+            else:
+                trend = "insufficient_data"
+
+            return {
+                "days": recent,
+                "stats": {
+                    "mean": round(mean, 1),
+                    "stddev": round(stddev, 1),
+                    "anomaly_today": anomaly,
+                    "trend": trend,
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def check_reputation(self, ip: str) -> dict:
+        """Check IP reputation via AbuseIPDB (with Redis cache)."""
+        if ip.startswith(("192.168.", "10.", "127.", "172.16.")):
+            return {"ip": ip, "error": "Private IP — no external reputation data"}
+
+        # Check Redis cache first
+        cache_key = f"abuseipdb:{ip}"
+        try:
+            cached = await self.redis.get(cache_key)
+            if cached:
+                result = json.loads(cached)
+                result["cached"] = True
+                return result
+        except Exception:
+            pass
+
+        # Call AbuseIPDB
+        api_key = os.environ.get("ABUSEIPDB_KEY", "")
+        if not api_key:
+            return {"ip": ip, "error": "ABUSEIPDB_KEY not configured"}
+
+        try:
+            async with self.http_session.get(
+                "https://api.abuseipdb.com/api/v2/check",
+                headers={"Key": api_key, "Accept": "application/json"},
+                params={"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+            raw = data.get("data", {})
+            result = {
+                "ip": ip,
+                "abuse_score": raw.get("abuseConfidenceScore", 0),
+                "total_reports": raw.get("totalReports", 0),
+                "isp": raw.get("isp", ""),
+                "usage_type": raw.get("usageType", ""),
+                "domain": raw.get("domain", ""),
+                "country": raw.get("countryCode", ""),
+                "is_tor": raw.get("isTor", False),
+                "last_reported": raw.get("lastReportedAt", ""),
+                "cached": False,
+            }
+
+            # Cache for 24h
+            try:
+                await self.redis.setex(cache_key, 86400, json.dumps(result))
+            except Exception:
+                pass
+
+            return result
+        except Exception as e:
+            return {"ip": ip, "error": str(e)}
 
     # -------------------------------------------------------------------
     # Internal helpers
@@ -746,6 +871,34 @@ async def main():
                 description="Get AI Suricata service statistics: Redis queue depths, HiveCoder health, block counts.",
                 inputSchema={"type": "object", "properties": {}},
             ),
+            Tool(
+                name="get_trends",
+                description="Get historical alert trend data with anomaly detection. Shows daily totals, 7-day mean/stddev, and trend direction.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "days": {
+                            "type": "number",
+                            "description": "Number of days to return (default 7, max 90)",
+                            "default": 7,
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="check_reputation",
+                description="Check IP reputation via AbuseIPDB. Returns abuse score (0-100), report count, ISP, and country. Results cached for 24h.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "ip": {
+                            "type": "string",
+                            "description": "Public IP address to check",
+                        },
+                    },
+                    "required": ["ip"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -795,6 +948,12 @@ async def main():
                 )
             elif name == "suricata_stats":
                 result = await backend.get_stats()
+            elif name == "get_trends":
+                result = await backend.get_trends(
+                    days=min(arguments.get("days", 7), 90),
+                )
+            elif name == "check_reputation":
+                result = await backend.check_reputation(ip=arguments["ip"])
             else:
                 result = {"error": f"Unknown tool: {name}"}
 

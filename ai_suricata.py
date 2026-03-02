@@ -35,6 +35,9 @@ RESULT_KEY = "suricata:ai_results"     # enriched analysis results
 CORRELATION_KEY = "suricata:ai_correlations"
 SUMMARY_KEY = "suricata:ai_daily_summary"
 BLOCK_LOG_KEY = "suricata:ai_blocks"   # auto-block audit log
+REPEAT_KEY = "suricata:repeat_offenders"      # repeat offender scores
+REPEAT_TS_KEY = "suricata:repeat_offender_ts"  # first-seen timestamps
+DAILY_STATS_KEY = "suricata:daily_stats"       # historical daily stats
 
 # Behaviour
 POLL_INTERVAL = 2          # seconds between Redis polls
@@ -47,6 +50,10 @@ MAX_BLOCKS = 10000
 AUTO_BLOCK_ENABLED = os.environ.get("AUTO_BLOCK", "0") == "1"
 AUTO_BLOCK_CONFIDENCE = float(os.environ.get("AUTO_BLOCK_CONFIDENCE", "0.9"))
 BLOCK_ALIAS = os.environ.get("BLOCK_ALIAS", "ai_blocklist")
+
+# Repeat offender detection
+REPEAT_OFFENDER_THRESHOLD = int(os.environ.get("REPEAT_THRESHOLD", "3"))
+REPEAT_OFFENDER_WINDOW = int(os.environ.get("REPEAT_WINDOW", "86400"))  # 24h
 
 # NAS storage
 NAS_RESULTS_DIR = Path("/var/mnt/ai/suricata/ai_results")
@@ -107,6 +114,47 @@ def write_result_to_nas(result: dict):
             f.write(json.dumps(result, separators=(",", ":")) + "\n")
     except Exception as e:
         logger.warning(f"NAS write failed: {e}")
+
+
+def update_repeat_offenders(rc: RedisCluster, ips: list[str]):
+    """Increment correlation appearance count for each source IP."""
+    now = str(time.time())
+    for ip in ips:
+        if ip.startswith(("192.168.", "10.", "127.", "172.16.")):
+            continue
+        rc.zincrby(REPEAT_KEY, 1, ip)
+        if not rc.hexists(REPEAT_TS_KEY, ip):
+            rc.hset(REPEAT_TS_KEY, ip, now)
+
+
+def prune_repeat_offenders(rc: RedisCluster):
+    """Remove repeat offender entries older than the tracking window."""
+    cutoff = time.time() - REPEAT_OFFENDER_WINDOW
+    all_ts = rc.hgetall(REPEAT_TS_KEY)
+    for ip_bytes, ts_bytes in all_ts.items():
+        try:
+            ip = ip_bytes if isinstance(ip_bytes, str) else ip_bytes.decode()
+            ts = float(ts_bytes if isinstance(ts_bytes, str) else ts_bytes.decode())
+            if ts < cutoff:
+                rc.zrem(REPEAT_KEY, ip)
+                rc.hdel(REPEAT_TS_KEY, ip)
+        except (ValueError, TypeError):
+            pass
+
+
+def _map_category_to_abuseipdb(category: str) -> list[int]:
+    """Map AI Suricata categories to AbuseIPDB category IDs."""
+    mapping = {
+        "scan": [14],          # Port scan
+        "exploit": [15],       # Hacking
+        "c2": [15, 20],        # Hacking + Exploited Host
+        "exfiltration": [15],  # Hacking
+        "malware": [15, 20],   # Hacking + Exploited Host
+        "dos": [4],            # DDoS Attack
+        "bruteforce": [18],    # Brute-Force
+        "policy": [14],        # Port scan (generic)
+    }
+    return mapping.get(category, [14])
 
 
 def maybe_auto_block(
@@ -176,6 +224,16 @@ def maybe_auto_block(
         should_block = True
         reason_tag = f"malicious category: {category}"
 
+    # Tier 5: Repeat offender (seen in N+ correlation windows)
+    if not should_block:
+        try:
+            score = rc.zscore(REPEAT_KEY, src_ip)
+            if score and int(score) >= REPEAT_OFFENDER_THRESHOLD:
+                should_block = True
+                reason_tag = f"repeat offender ({int(score)} correlation appearances)"
+        except Exception:
+            pass
+
     if should_block:
         desc = (
             f"AI-blocked ({reason_tag}): "
@@ -193,6 +251,13 @@ def maybe_auto_block(
             }
             store_result(rc, BLOCK_LOG_KEY, block_entry, MAX_BLOCKS)
             logger.warning(f"AUTO-BLOCKED {src_ip}: {desc}")
+            # Report to AbuseIPDB if enabled
+            try:
+                from analyzer import abuseipdb_report
+                abuse_cats = _map_category_to_abuseipdb(category)
+                abuseipdb_report(src_ip, abuse_cats, desc[:1024])
+            except Exception:
+                pass
             return True
     return False
 
@@ -284,6 +349,14 @@ def main():
                         f"from {corr.get('source_ip', '?')} "
                         f"({corr.get('alert_count', 0)} alerts)"
                     )
+                # Update repeat offender tracking
+                corr_ips = [
+                    c.get("source_ip") for c in correlations
+                    if c.get("source_ip")
+                ]
+                if corr_ips:
+                    update_repeat_offenders(rc, corr_ips)
+                prune_repeat_offenders(rc)
                 last_correlation = now
 
             # ---------------------------------------------------------------
@@ -306,6 +379,45 @@ def main():
                         f"Daily summary: {summary.get('threat_level', '?')} — "
                         f"{summary.get('summary', '')}"
                     )
+
+                # Store daily stats for historical trend analysis
+                try:
+                    cat_counts = {}
+                    raw_results = rc.lrange(RESULT_KEY, 0, 4999)
+                    for raw_r in raw_results:
+                        try:
+                            r = json.loads(raw_r)
+                            if r.get("analyzed_at", "")[:10] == today:
+                                cat = r.get("category", "unknown")
+                                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    daily_record = {
+                        "date": today,
+                        "total_alerts": alerts_processed,
+                        "by_severity": {
+                            "critical": analyzer.stats.get("critical", 0),
+                            "high": analyzer.stats.get("high", 0),
+                        },
+                        "by_category": cat_counts,
+                        "blocked": analyzer.stats.get("blocked", 0),
+                        "analyzed": analyzer.stats.get("analyzed", 0),
+                        "deduplicated": analyzer.stats.get("deduplicated", 0),
+                        "errors": analyzer.stats.get("errors", 0),
+                    }
+                    day_ts = datetime.strptime(today, "%Y-%m-%d").replace(
+                        tzinfo=timezone.utc
+                    ).timestamp()
+                    rc.zadd(DAILY_STATS_KEY, {
+                        json.dumps(daily_record, separators=(",", ":")): day_ts
+                    })
+                    # Keep 90 days
+                    cutoff_ts = day_ts - (90 * 86400)
+                    rc.zremrangebyscore(DAILY_STATS_KEY, "-inf", cutoff_ts)
+                    logger.info("Stored daily stats for trend analysis")
+                except Exception as e:
+                    logger.warning(f"Failed to store daily stats: {e}")
+
                 last_summary_date = today
 
             # ---------------------------------------------------------------

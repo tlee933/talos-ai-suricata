@@ -30,6 +30,114 @@ HIVECODER_URL = os.environ.get(
 MAX_TOKENS = 512
 CORRELATION_WINDOW = 300  # 5 minutes — group alerts within this window
 
+# ---------------------------------------------------------------------------
+# GeoIP enrichment (optional)
+# ---------------------------------------------------------------------------
+GEOIP_ENABLED = os.environ.get("GEOIP_ENABLED", "0") == "1"
+GEOIP_CITY_DB = os.environ.get("GEOIP_CITY_DB", "/app/geoip/GeoLite2-City.mmdb")
+GEOIP_ASN_DB = os.environ.get("GEOIP_ASN_DB", "/app/geoip/GeoLite2-ASN.mmdb")
+
+_geoip_city = None
+_geoip_asn = None
+
+if GEOIP_ENABLED:
+    try:
+        import geoip2.database
+        _geoip_city = geoip2.database.Reader(GEOIP_CITY_DB)
+        _geoip_asn = geoip2.database.Reader(GEOIP_ASN_DB)
+        logger.info("GeoIP databases loaded")
+    except Exception as e:
+        logger.warning(f"GeoIP init failed (enrichment disabled): {e}")
+
+
+def geoip_lookup(ip: str) -> dict:
+    """Look up country and ASN for an IP. Returns empty dict on failure."""
+    if not _geoip_city and not _geoip_asn:
+        return {}
+    if ip.startswith(("192.168.", "10.", "127.", "172.16.")):
+        return {}
+    result = {}
+    try:
+        if _geoip_city:
+            city = _geoip_city.city(ip)
+            result["country"] = city.country.iso_code or ""
+            result["country_name"] = city.country.name or ""
+            result["city"] = city.city.name or ""
+    except Exception:
+        pass
+    try:
+        if _geoip_asn:
+            asn = _geoip_asn.asn(ip)
+            result["asn"] = f"AS{asn.autonomous_system_number}" if asn.autonomous_system_number else ""
+            result["asn_org"] = asn.autonomous_system_organization or ""
+    except Exception:
+        pass
+    return result
+
+
+# ---------------------------------------------------------------------------
+# AbuseIPDB enrichment (optional)
+# ---------------------------------------------------------------------------
+ABUSEIPDB_ENABLED = os.environ.get("ABUSEIPDB_ENABLED", "0") == "1"
+ABUSEIPDB_KEY = os.environ.get("ABUSEIPDB_KEY", "")
+ABUSEIPDB_CACHE_TTL = int(os.environ.get("ABUSEIPDB_CACHE_TTL", "86400"))
+_abuseipdb_cache: dict[str, tuple[float, dict]] = {}  # ip -> (timestamp, data)
+
+
+def abuseipdb_check(ip: str) -> dict:
+    """Check an IP against AbuseIPDB. Returns cached or fresh result."""
+    if not ABUSEIPDB_ENABLED or not ABUSEIPDB_KEY:
+        return {}
+    if ip.startswith(("192.168.", "10.", "127.", "172.16.")):
+        return {}
+    now = time.time()
+    if ip in _abuseipdb_cache:
+        ts, data = _abuseipdb_cache[ip]
+        if now - ts < ABUSEIPDB_CACHE_TTL:
+            return data
+    try:
+        resp = requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("data", {})
+        result = {
+            "abuse_score": raw.get("abuseConfidenceScore", 0),
+            "total_reports": raw.get("totalReports", 0),
+            "isp": raw.get("isp", ""),
+            "usage_type": raw.get("usageType", ""),
+            "domain": raw.get("domain", ""),
+            "country": raw.get("countryCode", ""),
+        }
+        _abuseipdb_cache[ip] = (now, result)
+        return result
+    except Exception as e:
+        logger.debug(f"AbuseIPDB check failed for {ip}: {e}")
+        return {}
+
+
+def abuseipdb_report(ip: str, categories: list[int], comment: str):
+    """Report an IP to AbuseIPDB after auto-block."""
+    if not ABUSEIPDB_ENABLED or not ABUSEIPDB_KEY:
+        return
+    try:
+        requests.post(
+            "https://api.abuseipdb.com/api/v2/report",
+            headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"},
+            data={
+                "ip": ip,
+                "categories": ",".join(str(c) for c in categories),
+                "comment": comment[:1024],
+            },
+            timeout=10,
+        )
+        logger.info(f"Reported {ip} to AbuseIPDB")
+    except Exception as e:
+        logger.debug(f"AbuseIPDB report failed for {ip}: {e}")
+
 
 def alert_hash(alert: dict) -> str:
     """Generate a dedup hash for an alert."""
@@ -174,6 +282,19 @@ class AlertAnalyzer:
         if "payload_printable" in alert:
             alert_context["payload_sample"] = alert["payload_printable"][:300]
 
+        # GeoIP enrichment
+        src_geo = geoip_lookup(alert_context["src_ip"])
+        dst_geo = geoip_lookup(alert_context["dest_ip"])
+        if src_geo:
+            alert_context["src_geo"] = src_geo
+        if dst_geo:
+            alert_context["dest_geo"] = dst_geo
+
+        # AbuseIPDB enrichment
+        abuse_data = abuseipdb_check(alert_context["src_ip"])
+        if abuse_data:
+            alert_context["abuseipdb"] = abuse_data
+
         prompt = ALERT_ANALYSIS_PROMPT.format(
             alert_json=json.dumps(alert_context, indent=2)
         )
@@ -249,6 +370,10 @@ class AlertAnalyzer:
                 result["source_ip"] = src_ip
                 result["alert_count"] = len(alerts)
                 result["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+                # GeoIP enrichment for correlation
+                src_geo = geoip_lookup(src_ip)
+                if src_geo:
+                    result["source_geo"] = src_geo
                 results.append(result)
 
         self.alert_buffer.clear()

@@ -20,6 +20,10 @@ Direction guide:
 - If dest_ip is our WAN IP or in HOME_NET → traffic is coming TO us
 - in_iface=em1 means captured on WAN interface
 
+Enrichment data (when available):
+- src_geo/dest_geo: GeoIP country, city, ASN. Known bulletproof hosting ASNs (e.g. AS9009, AS49981, AS202425) raise suspicion.
+- abuseipdb: abuse_score (0-100), total_reports. Score >= 50 is suspicious, >= 80 is high-confidence malicious.
+
 Your job: triage Suricata alerts quickly and accurately.
 Respond with ONLY valid JSON — no commentary, no markdown."""
 
@@ -33,6 +37,7 @@ Consider:
 - alert.action "allowed" means IDS mode (not blocked), not that it was permitted intentionally
 - Single inbound SYN to closed ports from random IPs is internet background noise, not targeted
 - Outbound alerts from HOME_NET are more concerning than inbound probe responses
+- Factor in GeoIP country/ASN and AbuseIPDB abuse_score when available — bulletproof hosting ASNs and high abuse scores increase confidence
 
 Respond with ONLY valid JSON:
 {{
