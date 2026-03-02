@@ -38,6 +38,7 @@ BLOCK_LOG_KEY = "suricata:ai_blocks"   # auto-block audit log
 REPEAT_KEY = "suricata:repeat_offenders"      # repeat offender scores
 REPEAT_TS_KEY = "suricata:repeat_offender_ts"  # first-seen timestamps
 DAILY_STATS_KEY = "suricata:daily_stats"       # historical daily stats
+DNSBL_KEY = "suricata:dnsbl"                   # AI-curated domain blocklist
 
 # Behaviour
 POLL_INTERVAL = 2          # seconds between Redis polls
@@ -155,6 +156,119 @@ def _map_category_to_abuseipdb(category: str) -> list[int]:
         "policy": [14],        # Port scan (generic)
     }
     return mapping.get(category, [14])
+
+
+# Domains to never blocklist (legitimate infrastructure)
+DNSBL_WHITELIST = {
+    # DNS providers
+    "dns.google", "dns.quad9.net", "cloudflare-dns.com", "one.one.one.one",
+    # CDNs and major platforms
+    "cloudflare.com", "akamai.net", "fastly.net", "amazonaws.com",
+    "googlevideo.com", "gstatic.com", "google.com", "googleapis.com",
+    "microsoft.com", "apple.com", "icloud.com",
+    # Our infrastructure
+    "opnsense.local",
+}
+# TLDs that are just noise (IP-based PTR records, arpa, etc.)
+DNSBL_SKIP_TLDS = {".arpa", ".local", ".lan", ".internal", ".home"}
+MAX_DNSBL = 10000
+
+
+def extract_domains_from_alert(alert: dict) -> list[str]:
+    """Extract domain indicators from a raw Suricata alert."""
+    domains = []
+    # TLS SNI — most reliable domain indicator
+    sni = alert.get("tls", {}).get("sni", "")
+    if sni:
+        domains.append(sni)
+    # DNS query name
+    dns = alert.get("dns", {})
+    rrname = dns.get("rrname", "")
+    if rrname:
+        domains.append(rrname.rstrip("."))
+    # HTTP hostname
+    http = alert.get("http", {})
+    hostname = http.get("hostname", "")
+    if hostname:
+        domains.append(hostname)
+    # Deduplicate, filter junk
+    seen = set()
+    clean = []
+    for d in domains:
+        d = d.lower().strip()
+        if not d or d in seen:
+            continue
+        # Skip IP addresses
+        if d.replace(".", "").isdigit():
+            continue
+        # Skip whitelisted domains and subdomains
+        if any(d == w or d.endswith("." + w) for w in DNSBL_WHITELIST):
+            continue
+        # Skip noise TLDs
+        if any(d.endswith(tld) for tld in DNSBL_SKIP_TLDS):
+            continue
+        # Must have at least one dot (valid domain)
+        if "." not in d:
+            continue
+        seen.add(d)
+        clean.append(d)
+    return clean
+
+
+def maybe_add_to_dnsbl(
+    alert: dict, result: dict, rc: RedisCluster
+):
+    """Add domains from confirmed-malicious alerts to the DNSBL."""
+    severity = result.get("severity", "info")
+    confidence = result.get("confidence", 0.0)
+    fp = result.get("false_positive_likelihood", "high")
+    category = result.get("category", "")
+    action = result.get("recommended_action", "")
+
+    # Only blocklist domains from high-confidence malicious alerts
+    if severity not in ("critical", "high"):
+        return
+    if confidence < 0.7:
+        return
+    if fp != "low":
+        return
+    if category in ("info", "false_positive", "scan"):
+        # Scans don't have meaningful domain indicators
+        return
+
+    domains = extract_domains_from_alert(alert)
+    if not domains:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    for domain in domains:
+        entry = json.dumps({
+            "domain": domain,
+            "category": category,
+            "severity": severity,
+            "confidence": confidence,
+            "action": action,
+            "src_ip": alert.get("src_ip", ""),
+            "signature": alert.get("alert", {}).get("signature", ""),
+            "added_at": now,
+        }, separators=(",", ":"))
+        # Use domain as hash field — auto-deduplicates
+        rc.hset(DNSBL_KEY, domain, entry)
+
+    # Trim if too large (keep newest by just capping size)
+    if rc.hlen(DNSBL_KEY) > MAX_DNSBL:
+        all_entries = rc.hgetall(DNSBL_KEY)
+        # Sort by added_at, remove oldest
+        sorted_entries = sorted(
+            all_entries.items(),
+            key=lambda x: json.loads(x[1]).get("added_at", ""),
+            reverse=True,
+        )
+        to_remove = [k for k, _ in sorted_entries[MAX_DNSBL:]]
+        if to_remove:
+            rc.hdel(DNSBL_KEY, *to_remove)
+
+    logger.info(f"DNSBL: added {len(domains)} domain(s): {', '.join(domains)}")
 
 
 def maybe_auto_block(
@@ -351,6 +465,7 @@ def main():
                     store_result(rc, RESULT_KEY, result, MAX_RESULTS)
                     write_result_to_nas(result)
                     maybe_auto_block(result, opn, rc)
+                    maybe_add_to_dnsbl(alert, result, rc)
                     alerts_processed += 1
                     batch_count += 1
 

@@ -57,6 +57,7 @@ KEY_AI_BLOCKS = "suricata:ai_blocks"
 KEY_REPEAT_OFFENDERS = "suricata:repeat_offenders"
 KEY_REPEAT_TS = "suricata:repeat_offender_ts"
 KEY_DAILY_STATS = "suricata:daily_stats"
+KEY_DNSBL = "suricata:dnsbl"
 
 # Prompts (inline — keep MCP server self-contained)
 ANALYSIS_SYSTEM = (
@@ -576,6 +577,27 @@ class AISuricataMCP:
         except Exception as e:
             return {"error": str(e)}
 
+    async def get_dnsbl(self, limit: int = 100) -> dict:
+        """Get AI-curated domain blocklist."""
+        try:
+            raw = await self.redis.hgetall(KEY_DNSBL)
+            entries = []
+            for domain, data in raw.items():
+                try:
+                    d = json.loads(data)
+                    d["domain"] = domain
+                    entries.append(d)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            entries.sort(key=lambda x: x.get("added_at", ""), reverse=True)
+            return {
+                "count": len(entries),
+                "domains": entries[:limit],
+                "feed_url": "http://alderlake:8080/api/dnsbl.txt",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
     async def check_reputation(self, ip: str) -> dict:
         """Check IP reputation via AbuseIPDB (with Redis cache)."""
         if ip.startswith(("192.168.", "10.", "127.", "172.16.")):
@@ -886,6 +908,20 @@ async def main():
                 },
             ),
             Tool(
+                name="get_dnsbl",
+                description="Get AI-curated domain blocklist. Domains extracted from confirmed-malicious alerts (C2, malware, exploits). Feed URL for OPNsense Unbound integration.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "number",
+                            "description": "Max domains to return (default 100)",
+                            "default": 100,
+                        },
+                    },
+                },
+            ),
+            Tool(
                 name="check_reputation",
                 description="Check IP reputation via AbuseIPDB. Returns abuse score (0-100), report count, ISP, and country. Results cached for 24h.",
                 inputSchema={
@@ -951,6 +987,10 @@ async def main():
             elif name == "get_trends":
                 result = await backend.get_trends(
                     days=min(arguments.get("days", 7), 90),
+                )
+            elif name == "get_dnsbl":
+                result = await backend.get_dnsbl(
+                    limit=arguments.get("limit", 100),
                 )
             elif name == "check_reputation":
                 result = await backend.check_reputation(ip=arguments["ip"])

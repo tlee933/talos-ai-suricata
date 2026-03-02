@@ -444,6 +444,27 @@ def get_trends():
         return {"days": [], "error": "Failed to read trends"}
 
 
+def get_dnsbl():
+    """Get AI-curated domain blocklist from Redis."""
+    rc = get_redis()
+    if not rc:
+        return []
+    try:
+        raw = rc.hgetall("suricata:dnsbl")
+        entries = []
+        for domain, data in raw.items():
+            try:
+                d = json.loads(data)
+                d["domain"] = domain if isinstance(domain, str) else domain.decode()
+                entries.append(d)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        entries.sort(key=lambda x: x.get("added_at", ""), reverse=True)
+        return entries
+    except Exception:
+        return []
+
+
 def get_ai_blocks():
     """Get AI block log from Redis."""
     rc = get_redis()
@@ -828,6 +849,25 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write("\n".join(ips).encode())
+
+        elif path == "/api/dnsbl.txt":
+            # Plain text domain list — one domain per line
+            # Compatible with OPNsense Unbound DNSBL custom blocklist
+            entries = get_dnsbl()
+            domains = sorted(set(e.get("domain", "") for e in entries if e.get("domain")))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write("\n".join(domains).encode())
+
+        elif path == "/api/dnsbl.json":
+            entries = get_dnsbl()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(entries).encode())
 
         elif path == "/api/blocklist.csv":
             blocks = get_ai_blocks()
