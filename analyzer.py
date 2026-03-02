@@ -50,6 +50,98 @@ if GEOIP_ENABLED:
         logger.warning(f"GeoIP init failed (enrichment disabled): {e}")
 
 
+# ---------------------------------------------------------------------------
+# GeoIP threat risk scoring
+# ---------------------------------------------------------------------------
+# Country risk tiers (based on aggregate threat intel: AbuseIPDB, Spamhaus,
+# Shadowserver, Shodan honeypot data). Score = base threat probability.
+COUNTRY_RISK = {
+    # Critical — state-sponsored cyber operations, heavy scanning
+    "KP": 0.9,   # North Korea
+    # High — massive scanning/exploitation volumes, bulletproof hosting
+    "CN": 0.7, "RU": 0.7, "IR": 0.7,
+    # Elevated — significant botnet/scanning activity
+    "VN": 0.5, "BR": 0.5, "IN": 0.5, "ID": 0.5, "PK": 0.5,
+    "BD": 0.5, "NG": 0.5, "KZ": 0.5, "TH": 0.5,
+    # Moderate — known bulletproof hosting destinations
+    "UA": 0.4, "MD": 0.4, "RO": 0.35, "BG": 0.35, "BY": 0.4,
+    "VE": 0.3, "EG": 0.3, "PH": 0.3, "AR": 0.3,
+}
+# Default country risk for unlisted countries
+COUNTRY_RISK_DEFAULT = 0.15
+
+# ASN risk tiers — specific ASNs notorious for hosting abuse
+ASN_RISK = {
+    # Bulletproof hosting — almost exclusively malicious traffic
+    "AS9009": 0.85,    # M247 (Romania/NL) — #1 abuse ASN globally
+    "AS49981": 0.8,    # WorldStream (NL)
+    "AS202425": 0.8,   # IP Volume (NL)
+    "AS44477": 0.75,   # Stark Industries (Moldova) — APT infrastructure
+    "AS213035": 0.75,  # Changway Technologies (HK) — bulletproof
+    "AS57523": 0.7,    # Chang Way (RU)
+    "AS51396": 0.7,    # Pfcloud (RU)
+    "AS211736": 0.7,   # FOP Dmytro Nedilskyi (UA)
+    # High abuse — frequently used for scanning/exploitation
+    "AS14061": 0.45,   # DigitalOcean
+    "AS63949": 0.45,   # Akamai/Linode
+    "AS20473": 0.45,   # Vultr/Choopa
+    "AS16276": 0.4,    # OVHcloud
+    "AS24940": 0.4,    # Hetzner
+    "AS45090": 0.4,    # Shenzhen Tencent
+    "AS398324": 0.35,  # Censys scanning
+    "AS398722": 0.35,  # Censys scanning
+    # Cloud providers — legitimate but heavily abused
+    "AS16509": 0.25,   # Amazon AWS
+    "AS15169": 0.25,   # Google Cloud
+    "AS8075": 0.25,    # Microsoft Azure
+    "AS13335": 0.2,    # Cloudflare
+    # Low risk — major ISPs, CDNs, trusted infrastructure
+    "AS7922": 0.05,    # Comcast
+    "AS7018": 0.05,    # AT&T
+    "AS701": 0.05,     # Verizon
+    "AS20115": 0.05,   # Charter
+}
+
+
+def geo_risk_score(geo_data: dict) -> dict:
+    """Calculate threat risk score from GeoIP data.
+
+    Returns:
+        {score: 0.0-1.0, tier: str, factors: [str]}
+    """
+    if not geo_data:
+        return {"score": 0.0, "tier": "unknown", "factors": ["no GeoIP data"]}
+
+    country = geo_data.get("country", "")
+    asn = geo_data.get("asn", "")
+
+    country_score = COUNTRY_RISK.get(country, COUNTRY_RISK_DEFAULT)
+    asn_score = ASN_RISK.get(asn, 0.0)
+
+    # Take the higher of country vs ASN risk (ASN is more specific)
+    score = max(country_score, asn_score)
+    factors = []
+
+    if country in COUNTRY_RISK:
+        factors.append(f"country {country} (risk {country_score})")
+    if asn in ASN_RISK:
+        factors.append(f"{asn} {geo_data.get('asn_org', '')} (risk {asn_score})")
+
+    # Tier classification
+    if score >= 0.7:
+        tier = "critical"
+    elif score >= 0.5:
+        tier = "high"
+    elif score >= 0.3:
+        tier = "elevated"
+    elif score >= 0.15:
+        tier = "moderate"
+    else:
+        tier = "low"
+
+    return {"score": round(score, 2), "tier": tier, "factors": factors}
+
+
 def geoip_lookup(ip: str) -> dict:
     """Look up country and ASN for an IP. Returns empty dict on failure."""
     if not _geoip_city and not _geoip_asn:
@@ -282,11 +374,13 @@ class AlertAnalyzer:
         if "payload_printable" in alert:
             alert_context["payload_sample"] = alert["payload_printable"][:300]
 
-        # GeoIP enrichment
+        # GeoIP enrichment + risk scoring
         src_geo = geoip_lookup(alert_context["src_ip"])
         dst_geo = geoip_lookup(alert_context["dest_ip"])
         if src_geo:
             alert_context["src_geo"] = src_geo
+            risk = geo_risk_score(src_geo)
+            alert_context["geo_risk"] = risk
         if dst_geo:
             alert_context["dest_geo"] = dst_geo
 

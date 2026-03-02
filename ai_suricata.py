@@ -181,13 +181,27 @@ def maybe_auto_block(
     if not src_ip or src_ip.startswith(("192.168.", "10.", "127.", "172.16.")):
         return False  # never block local IPs
 
+    # Geo risk confidence boost — high-risk origins get a boost
+    geo_risk = result.get("source_alert", {}).get("geo_risk", {})
+    geo_score = geo_risk.get("score", 0.0)
+    geo_tier = geo_risk.get("tier", "unknown")
+    # Boost: critical geo = +0.15, high = +0.10, elevated = +0.05
+    geo_boost = 0.0
+    if geo_score >= 0.7:
+        geo_boost = 0.15
+    elif geo_score >= 0.5:
+        geo_boost = 0.10
+    elif geo_score >= 0.3:
+        geo_boost = 0.05
+    effective_confidence = min(confidence + geo_boost, 1.0)
+
     should_block = False
     reason_tag = ""
 
-    # Tier 1: High-confidence threats (original logic)
+    # Tier 1: High-confidence threats
     if (
         action == "block"
-        and confidence >= AUTO_BLOCK_CONFIDENCE
+        and effective_confidence >= AUTO_BLOCK_CONFIDENCE
         and severity in ("critical", "high")
         and fp == "low"
     ):
@@ -197,7 +211,7 @@ def maybe_auto_block(
     # Tier 2: Medium severity with strong block signal
     elif (
         action == "block"
-        and confidence >= 0.75
+        and effective_confidence >= 0.75
         and severity == "medium"
         and fp in ("low", "medium")
         and category not in ("info", "false_positive")
@@ -209,7 +223,7 @@ def maybe_auto_block(
     elif (
         action == "investigate"
         and severity == "critical"
-        and confidence >= 0.7
+        and effective_confidence >= 0.7
         and fp == "low"
     ):
         should_block = True
@@ -218,13 +232,24 @@ def maybe_auto_block(
     # Tier 4: Known malicious categories regardless of action
     elif (
         category in ("malware", "c2", "exfiltration", "exploit")
-        and confidence >= 0.7
+        and effective_confidence >= 0.7
         and fp == "low"
     ):
         should_block = True
         reason_tag = f"malicious category: {category}"
 
-    # Tier 5: Repeat offender (seen in N+ correlation windows)
+    # Tier 5: High-risk origin with any block/investigate recommendation
+    elif (
+        geo_score >= 0.7
+        and action in ("block", "investigate")
+        and severity in ("critical", "high", "medium")
+        and effective_confidence >= 0.6
+        and fp in ("low", "medium")
+    ):
+        should_block = True
+        reason_tag = f"high-risk origin ({geo_tier}, geo_score={geo_score})"
+
+    # Tier 6: Repeat offender (seen in N+ correlation windows)
     if not should_block:
         try:
             score = rc.zscore(REPEAT_KEY, src_ip)
@@ -235,10 +260,15 @@ def maybe_auto_block(
             pass
 
     if should_block:
+        geo_info = ""
+        if geo_risk.get("factors"):
+            geo_info = f" [{', '.join(geo_risk['factors'])}]"
         desc = (
             f"AI-blocked ({reason_tag}): "
             f"{result.get('description', 'threat detected')} "
-            f"(confidence={confidence}, severity={severity})"
+            f"(confidence={confidence}"
+            f"{f'+{geo_boost:.2f} geo' if geo_boost else ''}"
+            f", severity={severity}){geo_info}"
         )
         success = opn.add_ip_to_alias(BLOCK_ALIAS, src_ip, desc)
         if success:
